@@ -1,0 +1,27 @@
+# Render "Blueprint": lets you deploy by clicking New + > Blueprint and picking this repo.
+# A persistent disk is REQUIRED (SQLite must survive restarts) and needs a paid instance type.
+services:
+  - type: web
+    name: a2a-invoice-agent
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /healthz
+    disk:
+      name: agent-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATABASE_PATH
+        value: /var/data/invoice_agent.sqlite3
+      - key: A2A_BEARER_TOKEN
+        generateValue: true
+      - key: AI_BASE_URL
+        sync: false
+      - key: AI_MODEL
+        sync: false
+      - key: AI_API_KEY
+        sync: false

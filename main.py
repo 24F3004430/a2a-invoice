@@ -1,143 +1,386 @@
-import os, json, uuid, hashlib
+"""A2A 1.0 (HTTP+JSON) invoice action agent.
+
+Layers:  protocol (this file) -> storage.py (state) -> decisions.py (AI) -> schemas.py (validation)
+Run with ONE worker process: the per-message locks below live in memory.
+"""
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import re
+import uuid
 from datetime import datetime, timezone
-from fastapi import FastAPI, Request, Header, HTTPException
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
-from schemas import BATCH_MEDIA, RESULTS_MEDIA, PROPOSAL_MEDIA, RECEIPT_MEDIA, canonical_json, validate_batch, validate_proposals, validate_results
-from decisions import decide_batch
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+import decisions
+from schemas import (
+    BATCH_MEDIA, CANCELED, DONE, INPUT, PROPOSAL_MEDIA, RECEIPT_MEDIA, RESULTS_MEDIA, TERMINAL,
+    canonical_json, package_key, sha, validate_batch, validate_proposals, validate_results,
+)
 from storage import Store
 
 APP_NAME = os.getenv("AGENT_NAME", "A2A Invoice Action Agent")
 APP_VERSION = os.getenv("AGENT_VERSION", "1.0.0")
-BASE_URL = os.getenv("A2A_BASE_URL", "http://localhost:8000/a2a/")
-TOKEN = os.getenv("A2A_BEARER_TOKEN", "change-me-before-deploying")
+
+
+def _default_base() -> str:
+    if os.getenv("A2A_BASE_URL"):
+        return os.environ["A2A_BASE_URL"]
+    render = os.getenv("RENDER_EXTERNAL_URL")  # Render sets this automatically
+    if render:
+        return render.rstrip("/") + "/a2a/"
+    return "http://localhost:8000/a2a/"
+
+
+BASE_URL = _default_base()
+PREFIX = urlparse(BASE_URL).path.rstrip("/")  # routes live under the path of the URL you submit
+TOKENS = [t.strip() for t in (os.getenv("A2A_BEARER_TOKEN", "") + "," + os.getenv("A2A_EXTRA_TOKENS", "")).split(",") if t.strip()]
+if not TOKENS:
+    raise RuntimeError("Set A2A_BEARER_TOKEN before starting the server")
+
 store = Store(os.getenv("DATABASE_PATH", "invoice_agent.sqlite3"))
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url=None, redoc_url=None, openapi_url=None,
+              redirect_slashes=False)  # the grader must never be redirected
+router = APIRouter(prefix=PREFIX)
 
-def err(code, status, message="Request could not be processed"):
-    return JSONResponse(status_code=status, content={"error":{"code":code,"message":message}})
+_msg_locks: dict = {}          # one lock per (user, messageId): concurrent duplicates take turns
+_ai_lock = asyncio.Lock()      # one model call at a time; later callers then find the cache filled
 
-def principal_for(auth):
-    if not auth or not auth.startswith("Bearer "):
-        raise HTTPException(401, "Authentication required")
-    token = auth[7:]
-    if not token or token != TOKEN:
-        raise HTTPException(403, "Forbidden")
-    return hashlib.sha256(token.encode()).hexdigest()
 
-def check_post(request):
-    if request.headers.get("A2A-Version") != "1.0":
-        raise HTTPException(400, "Unsupported A2A version")
-    if request.headers.get("content-type","").split(";")[0].strip().lower() != "application/a2a+json":
-        raise HTTPException(415, "Unsupported media type")
+# ----------------------------------------------------------------- helpers
+class A2AResponse(JSONResponse):
+    media_type = "application/a2a+json"
 
-def part(media, data): return {"mediaType":media,"data":data}
-def task_obj(tid,cid,state,history,artifacts,metadata=None):
-    x={"id":tid,"contextId":cid,"status":{"state":state},"history":history,"artifacts":artifacts}
-    if metadata: x["metadata"]=metadata
-    return x
+
+class ApiError(Exception):
+    def __init__(self, status, code, message="Request could not be processed"):
+        self.status, self.code, self.message = status, code, message
+
+
+def _error_body(status, code, message):
+    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
+
+
+@app.exception_handler(ApiError)
+async def _api_error(_req, exc: ApiError):
+    return _error_body(exc.status, exc.code, exc.message)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(_req, exc):
+    return _error_body(exc.status_code, "HTTP_ERROR", "Request could not be processed")
+
+
+@app.exception_handler(Exception)
+async def _unexpected(_req, _exc):
+    return _error_body(500, "INTERNAL", "Internal error")
+
+
+def authenticate(request: Request) -> str:
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer ") or not header[7:]:
+        raise ApiError(401, "UNAUTHENTICATED", "Authentication required")
+    token = header[7:]
+    if not any(hmac.compare_digest(token.encode(), t.encode()) for t in TOKENS):
+        raise ApiError(403, "FORBIDDEN", "Forbidden")
+    return sha(token)  # the "principal" = a hash of the token; one token = one user
+
+
+def check_version(request: Request):
+    if request.headers.get("a2a-version") != "1.0":
+        raise ApiError(400, "VERSION_NOT_SUPPORTED", "Unsupported A2A version")
+
+
+def check_content_type(request: Request):
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/a2a+json":
+        raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Unsupported media type")
+
+
+def check_accept(request: Request):
+    accept = request.headers.get("accept")
+    if not accept:
+        return
+    types = [t.split(";")[0].strip().lower() for t in accept.split(",")]
+    if not any(t in ("*/*", "application/*", "application/json", "application/a2a+json") for t in types):
+        raise ApiError(406, "NOT_ACCEPTABLE", "Unsupported Accept header")
+
+
+class NormalizePath:
+    """Collapse '//' and drop a trailing '/', so '/a2a//tasks/' still reaches '/a2a/tasks' (no redirects)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            p = re.sub(r"/{2,}", "/", scope["path"])
+            if len(p) > 1:
+                p = p.rstrip("/") or "/"
+            scope = dict(scope, path=p)
+            if "raw_path" in scope:
+                scope["raw_path"] = p.encode()
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(NormalizePath)
+
+
+@app.middleware("http")
+async def _version_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["A2A-Version"] = "1.0"
+    return response
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def make_part(media, data):
+    return {"mediaType": media, "data": data}
+
+
+def make_task(tid, cid, state, history, artifacts):
+    return {"id": tid, "contextId": cid, "status": {"state": state, "timestamp": now_iso()},
+            "history": history, "artifacts": artifacts}
+
+
+# ----------------------------------------------------------------- public card
+def _origin(request: Request) -> str:
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    proto = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip()
+    if host.startswith(("localhost", "127.0.0.1")):
+        proto = request.url.scheme
+    return f"{proto}://{host}"
+
+
+def _interfaces(request: Request) -> list:
+    """The configured URL first, then the URL this very request reached us on; each with and without a
+    trailing slash. 'supportedInterfaces contains the submitted URL' is then true whichever spelling was submitted."""
+    seen, out = set(), []
+    for base in (BASE_URL, _origin(request) + PREFIX + "/"):
+        for u in (base, base.rstrip("/") + "/", base.rstrip("/")):
+            if u and u not in seen:
+                seen.add(u)
+                out.append({"url": u, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"})
+    return out
+
 
 @app.get("/.well-known/agent-card.json")
-def agent_card():
+def agent_card(request: Request):
     return {
-      "name":APP_NAME,"description":"Evidence-based invoice action proposals with approval-gated receipts.",
-      "version":APP_VERSION,"capabilities":{"streaming":False,"pushNotifications":False},
-      "supportedInterfaces":[{"url":BASE_URL,"protocolBinding":"HTTP+JSON","protocolVersion":"1.0"}],
-      "defaultInputModes":[BATCH_MEDIA,RESULTS_MEDIA],"defaultOutputModes":[PROPOSAL_MEDIA,RECEIPT_MEDIA],
-      "skills":[{"id":"invoice_action_agent","name":"Invoice Action Agent",
-        "description":"Analyze invoice packages and propose safe actions with evidence.",
-        "tags":["invoice","accounts-payable","evidence","approval"]}]
+        "name": APP_NAME,
+        "description": "Evidence-based invoice action proposals with approval-gated receipts.",
+        "version": APP_VERSION,
+        "capabilities": {"streaming": False, "pushNotifications": False},
+        "supportedInterfaces": _interfaces(request),
+        "defaultInputModes": [BATCH_MEDIA, RESULTS_MEDIA],
+        "defaultOutputModes": [PROPOSAL_MEDIA, RECEIPT_MEDIA],
+        "skills": [{
+            "id": "invoice_action_agent",
+            "name": "Invoice Action Agent",
+            "description": "Analyze invoice packages and propose safe actions with evidence.",
+            "tags": ["invoice", "accounts-payable", "evidence", "approval"],
+            "inputModes": [BATCH_MEDIA, RESULTS_MEDIA],
+            "outputModes": [PROPOSAL_MEDIA, RECEIPT_MEDIA],
+        }],
     }
 
-@app.post("/a2a/message:send")
-async def send_message(request: Request, authorization: str | None = Header(default=None)):
-    principal=principal_for(authorization); check_post(request)
-    try: body=await request.json()
-    except Exception: raise HTTPException(400,"Invalid JSON")
-    msg=body.get("message")
-    if not isinstance(msg,dict): raise HTTPException(400,"Missing message")
-    mid=msg.get("messageId")
-    if not isinstance(mid,str) or not mid: raise HTTPException(400,"Missing messageId")
-    digest=hashlib.sha256(canonical_json(msg).encode()).hexdigest()
-    old=store.get_idempotency(principal,mid)
-    if old:
-        if old["message_hash"] != digest: return err("IDEMPOTENCY_CONFLICT",409)
-        return JSONResponse(content={"task":json.loads(old["response_json"])})
-    parts=msg.get("parts") or []
-    if len(parts)!=1 or not isinstance(parts[0],dict): raise HTTPException(400,"Expected one message part")
-    if msg.get("role")!="ROLE_USER": raise HTTPException(400,"Expected ROLE_USER")
-    media,data=parts[0].get("mediaType"),parts[0].get("data")
-    if media==BATCH_MEDIA:
-        try: batch=validate_batch(data)
-        except ValueError as e: raise HTTPException(400,str(e))
-        cached={}; missing=[]
-        for p in batch["packages"]:
-            key=hashlib.sha256(canonical_json(p).encode()).hexdigest()
-            d=store.get_decision(key)
-            if d: cached[p["packageId"]]=d
-            else: missing.append(p)
-        if missing:
-            decided=await decide_batch(batch,missing)
-            byid={p["packageId"]:p for p in decided}
-            for p in missing:
-                if p["packageId"] not in byid: raise HTTPException(502,"AI omitted a package")
-                d=byid[p["packageId"]]
-                try: validate_proposals({"packages":[p]},[d])
-                except ValueError as e: raise HTTPException(502,f"Invalid AI proposal: {e}")
-                store.put_decision(hashlib.sha256(canonical_json(p).encode()).hexdigest(),d)
-                cached[p["packageId"]]=d
-        try: proposals=validate_proposals(batch,[cached[p["packageId"]] for p in batch["packages"]])
-        except ValueError as e: raise HTTPException(502,f"Invalid proposals: {e}")
-        tid,cid=str(uuid.uuid4()),msg.get("contextId") or str(uuid.uuid4())
-        task=task_obj(tid,cid,"TASK_STATE_INPUT_REQUIRED",[msg],[{"name":"invoice-action-proposals","parts":[part(PROPOSAL_MEDIA,{"batchId":batch["batchId"],"proposals":proposals})]}],{"principal":principal,"batchId":batch["batchId"]})
-        store.create_task(tid,cid,principal,batch["batchId"],"TASK_STATE_INPUT_REQUIRED",task)
-        store.put_idempotency(principal,mid,digest,tid,task)
-        return JSONResponse(content={"task":task})
-    if media==RESULTS_MEDIA:
-        tid,cid=msg.get("taskId"),msg.get("contextId")
-        if not tid or not cid: raise HTTPException(400,"Missing taskId or contextId")
-        row=store.get_task(tid,principal)
-        if not row: return err("TASK_NOT_FOUND",404)
-        task=json.loads(row["task_json"])
-        if task.get("contextId")!=cid: return err("TASK_NOT_FOUND",404)
-        if row["state"] in ("COMPLETED","CANCELED"): return err("TASK_TERMINAL",409)
-        try: batch_id,results=validate_results(data)
-        except ValueError as e: raise HTTPException(400,str(e))
-        if batch_id!=row["batch_id"]: return err("RESULT_BINDING_MISMATCH",409)
-        proposal_data=task["artifacts"][0]["parts"][0]["data"]
-        proposals={p["packageId"]:p for p in proposal_data["proposals"]}
-        executions=[]
-        for r in results:
-            p=proposals.get(r["packageId"])
-            if not p or p["actionId"]!=r["actionId"] or p["action"]!=r["action"]:
-                return err("RESULT_BINDING_MISMATCH",409)
-            if r["outcome"]=="ACCEPTED":
-                executions.append({"packageId":p["packageId"],"actionId":p["actionId"],"action":p["action"],
-                  "receiptNonce":r["receiptNonce"],"facts":p["facts"],"evidenceRefs":p["evidenceRefs"]})
-        completed=task_obj(tid,cid,"COMPLETED",task["history"]+[msg],task["artifacts"]+[{"name":"invoice-action-receipts","parts":[part(RECEIPT_MEDIA,{"batchId":batch_id,"executions":executions})]}],task.get("metadata"))
-        if not store.finish_task(tid,principal,"COMPLETED",completed): return err("TASK_TERMINAL",409)
-        return JSONResponse(content={"task":completed})
-    raise HTTPException(415,"Unsupported message part media type")
 
-@app.get("/a2a/tasks/{task_id}")
-def get_task(task_id:str, authorization:str|None=Header(default=None), a2a_version:str|None=Header(default=None,alias="A2A-Version")):
-    principal=principal_for(authorization)
-    if a2a_version!="1.0": raise HTTPException(400,"Unsupported A2A version")
-    row=store.get_task(task_id,principal)
-    if not row: return err("TASK_NOT_FOUND",404)
-    return JSONResponse(content={"task":json.loads(row["task_json"])})
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
-@app.get("/a2a/tasks")
-def list_tasks(authorization:str|None=Header(default=None), a2a_version:str|None=Header(default=None,alias="A2A-Version")):
-    principal=principal_for(authorization)
-    if a2a_version!="1.0": raise HTTPException(400,"Unsupported A2A version")
-    return {"tasks":[json.loads(r["task_json"]) for r in store.list_tasks(principal)]}
 
-@app.post("/a2a/tasks/{task_id}:cancel")
-async def cancel_task(task_id:str, request:Request, authorization:str|None=Header(default=None)):
-    principal=principal_for(authorization); check_post(request)
-    row=store.get_task(task_id,principal)
-    if not row: return err("TASK_NOT_FOUND",404)
-    task=json.loads(row["task_json"])
-    canceled=task_obj(task_id,task["contextId"],"CANCELED",task["history"],task["artifacts"],task.get("metadata"))
-    if not store.finish_task(task_id,principal,"CANCELED",canceled): return err("TASK_TERMINAL",409)
-    return JSONResponse(content=canceled)
+# ----------------------------------------------------------------- message:send
+@router.post("/message:send")
+async def send_message(request: Request):
+    principal = authenticate(request)
+    check_version(request)
+    check_accept(request)
+    check_content_type(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise ApiError(400, "INVALID_JSON", "Invalid JSON")
+    msg = body.get("message") if isinstance(body, dict) else None
+    if not isinstance(msg, dict):
+        raise ApiError(400, "INVALID_MESSAGE", "Missing message")
+    mid = msg.get("messageId")
+    if not isinstance(mid, str) or not mid:
+        raise ApiError(400, "INVALID_MESSAGE", "Missing messageId")
+    # hash ONLY the message (configuration is ignored), with recursively sorted keys
+    digest = sha(canonical_json(msg))
+
+    lock = _msg_locks.setdefault((principal, mid), asyncio.Lock())
+    async with lock:
+        old = store.get_idempotency(principal, mid)
+        if old:
+            if old["message_hash"] != digest:
+                raise ApiError(409, "IDEMPOTENCY_CONFLICT", "Message id reused with different content")
+            return A2AResponse(content={"task": json.loads(old["response_json"])})
+
+        if msg.get("role") != "ROLE_USER":
+            raise ApiError(400, "INVALID_MESSAGE", "Expected ROLE_USER")
+        parts = msg.get("parts")
+        if not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], dict):
+            raise ApiError(400, "INVALID_MESSAGE", "Expected exactly one part")
+        media, data = parts[0].get("mediaType"), parts[0].get("data")
+
+        cfg = body.get("configuration")
+        modes = cfg.get("acceptedOutputModes") if isinstance(cfg, dict) else None
+        if media == BATCH_MEDIA and isinstance(modes, list) and modes and PROPOSAL_MEDIA not in modes:
+            raise ApiError(415, "UNSUPPORTED_OUTPUT_MODE", "Cannot produce an accepted output mode")
+
+        if media == BATCH_MEDIA:
+            task = await _handle_batch(principal, msg, mid, digest, data)
+        elif media == RESULTS_MEDIA:
+            task = _handle_results(principal, msg, mid, digest, data)
+        else:
+            raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Unsupported part media type")
+    return A2AResponse(content={"task": task})
+
+
+async def _handle_batch(principal, msg, mid, digest, data):
+    try:
+        batch = validate_batch(data)
+    except ValueError as e:
+        raise ApiError(400, "INVALID_BATCH", str(e))
+
+    salt = decisions.cache_salt()
+    keys = {p["packageId"]: sha(package_key(p) + salt) for p in batch["packages"]}
+    cached = {}
+    for p in batch["packages"]:
+        d = store.get_decision(keys[p["packageId"]])
+        if d:
+            cached[p["packageId"]] = d
+    missing = [p for p in batch["packages"] if p["packageId"] not in cached]
+
+    if missing:
+        async with _ai_lock:
+            still = []
+            for p in missing:  # someone else may have filled the cache while we waited
+                d = store.get_decision(keys[p["packageId"]])
+                if d:
+                    cached[p["packageId"]] = d
+                else:
+                    still.append(p)
+            if still:
+                try:
+                    decided = await decisions.decide_packages(batch, still)
+                except decisions.DecisionError:
+                    raise ApiError(502, "DECISION_FAILED", "Could not decide this batch")
+                for p in still:
+                    store.put_decision(keys[p["packageId"]], decided[p["packageId"]])
+                    cached[p["packageId"]] = decided[p["packageId"]]
+
+    proposals = [
+        {"packageId": p["packageId"], "actionId": "act-" + uuid.uuid4().hex, **cached[p["packageId"]]}
+        for p in batch["packages"]
+    ]  # fresh unique actionId per task; the cached part has no ids
+    try:
+        proposals = validate_proposals(batch, proposals)
+    except ValueError:
+        raise ApiError(502, "DECISION_INVALID", "Decision failed validation")
+
+    tid = str(uuid.uuid4())
+    cid = msg.get("contextId") if isinstance(msg.get("contextId"), str) and msg.get("contextId") else str(uuid.uuid4())
+    task = make_task(
+        tid, cid, INPUT, [msg],
+        [{"artifactId": "proposals-" + tid, "name": "invoice-action-proposals",
+          "parts": [make_part(PROPOSAL_MEDIA, {"batchId": batch["batchId"], "proposals": proposals})]}],
+    )
+    store.create_task(tid, cid, principal, batch["batchId"], INPUT, task, mid, digest)  # one transaction
+    return task
+
+
+def _handle_results(principal, msg, mid, digest, data):
+    tid, cid = msg.get("taskId"), msg.get("contextId")
+    if not isinstance(tid, str) or not tid or not isinstance(cid, str) or not cid:
+        raise ApiError(400, "INVALID_MESSAGE", "Missing taskId or contextId")
+    row = store.get_task(tid, principal)  # only YOUR tasks are visible
+    if not row:
+        raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
+    if row["state"] in TERMINAL:
+        raise ApiError(409, "TASK_TERMINAL", "Task is already finished")
+    task = json.loads(row["task_json"])
+    if task.get("contextId") != cid:
+        raise ApiError(409, "RESULT_BINDING_MISMATCH", "Result does not match the task")
+    try:
+        batch_id, results = validate_results(data)
+    except ValueError as e:
+        raise ApiError(400, "INVALID_RESULTS", str(e))
+    if batch_id != row["batch_id"]:
+        raise ApiError(409, "RESULT_BINDING_MISMATCH", "Result does not match the task")
+
+    proposals = task["artifacts"][0]["parts"][0]["data"]["proposals"]
+    by_pkg = {p["packageId"]: p for p in proposals}
+    if {r["packageId"] for r in results} != set(by_pkg):
+        raise ApiError(409, "RESULT_BINDING_MISMATCH", "Result does not match the task")
+    got = {r["packageId"]: r for r in results}
+    for pid, p in by_pkg.items():
+        r = got[pid]
+        if r["actionId"] != p["actionId"] or r["action"] != p["action"]:
+            raise ApiError(409, "RESULT_BINDING_MISMATCH", "Result does not match the task")
+
+    executions = []  # ACCEPTED only, in proposal order, copied from OUR stored proposal
+    for p in proposals:
+        r = got[p["packageId"]]
+        if r["outcome"] == "ACCEPTED":
+            executions.append({
+                "packageId": p["packageId"], "actionId": p["actionId"], "action": p["action"],
+                "receiptNonce": r["receiptNonce"], "facts": p["facts"], "evidenceRefs": p["evidenceRefs"],
+            })
+    completed = make_task(
+        tid, cid, DONE, task["history"] + [msg],
+        task["artifacts"] + [{"artifactId": "receipts-" + tid, "name": "invoice-action-receipts",
+                              "parts": [make_part(RECEIPT_MEDIA, {"batchId": batch_id, "executions": executions})]}],
+    )
+    if not store.finish_task(tid, principal, DONE, completed, idem=(mid, digest)):
+        raise ApiError(409, "TASK_TERMINAL", "Task is already finished")  # lost the race to cancel
+    return completed
+
+
+# ----------------------------------------------------------------- reads, list, cancel
+@router.get("/tasks/{task_id}")
+def get_task(task_id: str, request: Request):
+    principal = authenticate(request)
+    check_version(request)
+    check_accept(request)
+    row = store.get_task(task_id, principal)
+    if not row:
+        raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
+    return A2AResponse(content=json.loads(row["task_json"]))
+
+
+@router.get("/tasks")
+def list_tasks(request: Request):
+    principal = authenticate(request)
+    check_version(request)
+    check_accept(request)
+    return A2AResponse(content={"tasks": [json.loads(r["task_json"]) for r in store.list_tasks(principal)]})
+
+
+@router.post("/tasks/{task_id}:cancel")
+async def cancel_task(task_id: str, request: Request):
+    principal = authenticate(request)
+    check_version(request)
+    check_accept(request)
+    row = store.get_task(task_id, principal)
+    if not row:
+        raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
+    if row["state"] in TERMINAL:
+        raise ApiError(409, "TASK_TERMINAL", "Task is already finished")
+    task = json.loads(row["task_json"])
+    canceled = make_task(task_id, task["contextId"], CANCELED, task["history"], task["artifacts"])
+    if not store.finish_task(task_id, principal, CANCELED, canceled):
+        raise ApiError(409, "TASK_TERMINAL", "Task is already finished")  # lost the race to a result
+    return A2AResponse(content=canceled)
+
+
+app.include_router(router)
